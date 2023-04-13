@@ -19,6 +19,7 @@ package kafka
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"sort"
 	"testing"
@@ -34,35 +35,100 @@ import (
 	"github.com/elastic/apm-data/model"
 	apmqueue "github.com/elastic/apm-queue"
 	"github.com/elastic/apm-queue/codec/json"
+	"github.com/elastic/apm-queue/kafka/sasl/plain"
 	"github.com/elastic/apm-queue/queuecontext"
 )
 
 func TestNewProducer(t *testing.T) {
-	_, err := NewProducer(ProducerConfig{})
-	assert.Error(t, err)
+	testCases := map[string]struct {
+		expectErr bool
+		cfg       ProducerConfig
+	}{
+		"empty": {
+			expectErr: true,
+		},
+		"invalid client producer options": {
+			cfg: ProducerConfig{
+				Brokers: []string{"localhost:invalidport"},
+				Logger:  zap.NewNop(),
+				Encoder: json.JSON{},
+				TopicRouter: func(event model.APMEvent) apmqueue.Topic {
+					return apmqueue.Topic("foo")
+				},
+			},
+			expectErr: true,
+		},
+		"valid": {
+			cfg: ProducerConfig{
+				Brokers:  []string{"localhost:9092"},
+				ClientID: "clientid",
+				Version:  "1.0",
+				Logger:   zap.NewNop(),
+				Encoder:  json.JSON{},
+				TopicRouter: func(event model.APMEvent) apmqueue.Topic {
+					return apmqueue.Topic("foo")
+				},
+				SASL:             saslplain.New(saslplain.Plain{}),
+				TLS:              &tls.Config{},
+				CompressionCodec: []kgo.CompressionCodec{ZstdCompression(), Lz4Compression(), SnappyCompression(), GzipCompression(), NoCompression()},
+			},
+			expectErr: false,
+		},
+	}
+	for name, tc := range testCases {
+		// This test ensures that basic producing is working, it tests:
+		// * Producing to a single topic
+		// * Producing a set number of records
+		// * Content contains headers from arbitrary metadata.
+		// * Record.Value can be decoded with the same codec.
+		t.Run(name, func(t *testing.T) {
+			p, err := NewProducer(tc.cfg)
+			if err == nil {
+				defer assert.NoError(t, p.Close())
+			}
+			if tc.expectErr {
+				assert.Error(t, err)
+				assert.Nil(t, p)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, p)
+			}
+		})
+	}
 }
 
 func TestNewProducerBasic(t *testing.T) {
-	// This test ensures that basic producing is working, it tests:
-	// * Producing to a single topic
-	// * Producing a set number of records
-	// * Content contains headers from arbitrary metadata.
-	// * Record.Value can be decoded with the same codec.
-	test := func(t *testing.T, sync bool) {
-		t.Run(fmt.Sprintf("sync_%t", sync), func(t *testing.T) {
+
+
+	testCases := map[string]struct {
+		sync bool
+	}{
+		"sync false": {
+			sync: false,
+		},
+		"sync true": {
+			sync: true,
+		},
+	}
+	for name, tc := range testCases {
+		// This test ensures that basic producing is working, it tests:
+		// * Producing to a single topic
+		// * Producing a set number of records
+		// * Content contains headers from arbitrary metadata.
+		// * Record.Value can be decoded with the same codec.
+		t.Run(name, func(t *testing.T) {
 			topic := "default-topic"
 			client, brokers := newClusterWithTopics(t, topic)
 			codec := json.JSON{}
-			producer, err := NewProducer(ProducerConfig{
+			producer := newProducer(t, ProducerConfig{
 				Brokers: brokers,
-				Sync:    sync,
+				Sync:    tc.sync,
 				Logger:  zap.NewNop(),
 				Encoder: codec,
 				TopicRouter: func(event model.APMEvent) apmqueue.Topic {
 					return apmqueue.Topic(topic)
 				},
 			})
-			require.NoError(t, err)
 
 			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 			defer cancel()
@@ -72,7 +138,7 @@ func TestNewProducerBasic(t *testing.T) {
 				{Transaction: &model.Transaction{ID: "1"}},
 				{Transaction: &model.Transaction{ID: "2"}},
 			}
-			if !sync {
+			if !tc.sync {
 				// Cancel the context before calling processBatch
 				var c func()
 				var ctxCancelled context.Context
@@ -119,8 +185,15 @@ func TestNewProducerBasic(t *testing.T) {
 			assert.Len(t, fetches.Records(), 0)
 		})
 	}
-	test(t, true)
-	test(t, false)
+}
+
+func newProducer(t *testing.T, cfg ProducerConfig) *Producer {
+	producer, err := NewProducer(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, producer.Close())
+	})
+	return producer
 }
 
 func newClusterWithTopics(t *testing.T, topics ...string) (*kgo.Client, []string) {
