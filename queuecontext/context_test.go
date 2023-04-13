@@ -49,3 +49,16 @@ func TestDetachedContext(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, map[string]string{"a": "b"}, meta)
 }
+
+func TestMetadataContext(t *testing.T) {
+	meta, ok := MetadataFromContext(context.Background())
+	assert.False(t, ok)
+	assert.Nil(t, meta)
+
+	meta = map[string]string{"a": "b"}
+	ctx := WithMetadata(context.Background(), meta)
+
+	meta, ok = MetadataFromContext(ctx)
+	require.True(t, ok)
+	assert.Equal(t, map[string]string{"a": "b"}, meta)
+}
